@@ -221,6 +221,50 @@ impl Request {
         Some(self.0.upstream)
     }
 
+    /// Cache lookup outcome for this request, mirroring
+    /// `$upstream_cache_status`.  `None` when the request did not
+    /// consult any cache (no `proxy_cache` / `fastcgi_cache` /
+    /// configured, or the request was processed before nginx
+    /// classified it).
+    #[cfg(ngx_feature = "http_cache")]
+    pub fn cache_status(&self) -> Option<crate::http::CacheStatus> {
+        if self.0.upstream.is_null() {
+            return None;
+        }
+        // SAFETY: `upstream` is non-null per the check above and is
+        // populated by nginx core for the lifetime of the request.
+        let status = unsafe { (*self.0.upstream).cache_status() };
+        crate::http::CacheStatus::from_raw(status as ngx_uint_t)
+    }
+
+    /// Name of the `proxy_cache_path` / `fastcgi_cache_path`
+    /// keys-zone consulted for this request, or `None` when no
+    /// cache lookup happened.
+    ///
+    /// Useful as the `zone=` label for cache metrics: `nginx_vts`,
+    /// `vts`, statsd exporters, etc.
+    #[cfg(ngx_feature = "http_cache")]
+    pub fn cache_zone_name(&self) -> Option<&NgxStr> {
+        if self.0.cache.is_null() {
+            return None;
+        }
+        // SAFETY: `cache` is non-null per the check above; the
+        // chained pointers are populated by `ngx_http_file_cache_init`
+        // in the master before workers fork and remain valid for the
+        // lifetime of the process.
+        unsafe {
+            let file_cache = (*self.0.cache).file_cache;
+            if file_cache.is_null() {
+                return None;
+            }
+            let shm_zone = (*file_cache).shm_zone;
+            if shm_zone.is_null() {
+                return None;
+            }
+            Some(NgxStr::from_ngx_str((*shm_zone).shm.name))
+        }
+    }
+
     /// Pointer to a [`ngx_connection_t`] client connection object.
     ///
     /// [`ngx_connection_t`]: https://nginx.org/en/docs/dev/development_guide.html#connection
@@ -799,4 +843,112 @@ enum MethodInner {
     Patch,
     Trace,
     Connect,
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use super::*;
+
+    fn zeroed_request() -> ngx_http_request_t {
+        // SAFETY: `ngx_http_request_t` is `#[repr(C)]` and tests only
+        // read the fields they populate below.
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    }
+
+    fn request_from(r: &mut ngx_http_request_t) -> &mut Request {
+        // SAFETY: `Request` is `#[repr(transparent)]` over `ngx_http_request_t`.
+        unsafe { Request::from_ngx_http_request(r) }
+    }
+
+    #[cfg(ngx_feature = "http_cache")]
+    mod cache {
+        use super::*;
+        use crate::ffi::{
+            NGX_HTTP_CACHE_HIT, NGX_HTTP_CACHE_MISS, ngx_http_cache_t, ngx_http_file_cache_t,
+            ngx_http_upstream_t, ngx_shm_zone_t, ngx_str_t,
+        };
+        use crate::http::CacheStatus;
+
+        #[test]
+        fn cache_status_none_when_upstream_null() {
+            let mut r = zeroed_request();
+            let req = request_from(&mut r);
+            assert_eq!(req.cache_status(), None);
+        }
+
+        #[test]
+        fn cache_status_none_when_field_is_zero_sentinel() {
+            // `cache_status == 0` is the "no cache lookup" sentinel
+            // nginx leaves on upstreams created for non-cached
+            // requests.  Must surface as `None`, not a fake variant.
+            let mut upstream: ngx_http_upstream_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            upstream.set_cache_status(0);
+            let mut r = zeroed_request();
+            r.upstream = &raw mut upstream;
+            let req = request_from(&mut r);
+            assert_eq!(req.cache_status(), None);
+        }
+
+        #[test]
+        fn cache_status_maps_hit_and_miss() {
+            let mut upstream: ngx_http_upstream_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            upstream.set_cache_status(NGX_HTTP_CACHE_HIT);
+            let mut r = zeroed_request();
+            r.upstream = &raw mut upstream;
+            assert_eq!(request_from(&mut r).cache_status(), Some(CacheStatus::Hit));
+
+            upstream.set_cache_status(NGX_HTTP_CACHE_MISS);
+            assert_eq!(request_from(&mut r).cache_status(), Some(CacheStatus::Miss));
+        }
+
+        #[test]
+        fn cache_zone_name_none_when_cache_null() {
+            let mut r = zeroed_request();
+            let req = request_from(&mut r);
+            assert!(req.cache_zone_name().is_none());
+        }
+
+        #[test]
+        fn cache_zone_name_none_when_file_cache_null() {
+            let mut cache: ngx_http_cache_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            // file_cache stays null after zero-init.
+            let mut r = zeroed_request();
+            r.cache = &raw mut cache;
+            assert!(request_from(&mut r).cache_zone_name().is_none());
+        }
+
+        #[test]
+        fn cache_zone_name_none_when_shm_zone_null() {
+            let mut file_cache: ngx_http_file_cache_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            // shm_zone stays null after zero-init.
+            let mut cache: ngx_http_cache_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            cache.file_cache = &raw mut file_cache;
+            let mut r = zeroed_request();
+            r.cache = &raw mut cache;
+            assert!(request_from(&mut r).cache_zone_name().is_none());
+        }
+
+        #[test]
+        fn cache_zone_name_returns_zone_name() {
+            let bytes = b"my_cache";
+            let mut shm_zone: ngx_shm_zone_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            shm_zone.shm.name = ngx_str_t { len: bytes.len(), data: bytes.as_ptr().cast_mut() };
+
+            let mut file_cache: ngx_http_file_cache_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            file_cache.shm_zone = &raw mut shm_zone;
+
+            let mut cache: ngx_http_cache_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            cache.file_cache = &raw mut file_cache;
+
+            let mut r = zeroed_request();
+            r.cache = &raw mut cache;
+
+            let name = request_from(&mut r).cache_zone_name().expect("should resolve");
+            assert_eq!(name.as_bytes(), bytes);
+        }
+    }
 }
