@@ -265,6 +265,70 @@ impl Request {
         }
     }
 
+    /// The `max_size` of the cache consulted for this request, in bytes,
+    /// or `None` when no cache lookup happened.
+    ///
+    /// nginx does not keep this figure in bytes:
+    /// `ngx_http_file_cache_init` divides the configured size by the
+    /// filesystem block size, so that it can be compared against the
+    /// running total directly.  Reading `max_size` off the struct
+    /// therefore gives a number some thousands of times too small,
+    /// with nothing to suggest anything is wrong.  Both this and
+    /// [`Request::cache_zone_used_size`] undo that, and
+    /// [`Request::cache_zone_block_size`] is there for callers that
+    /// want the raw unit.
+    #[cfg(ngx_feature = "http_cache")]
+    pub fn cache_zone_max_size(&self) -> Option<u64> {
+        let file_cache = self.file_cache()?;
+        // SAFETY: an initialized file cache holds both fields.
+        Some(unsafe { (*file_cache).max_size as u64 * (*file_cache).bsize as u64 })
+    }
+
+    /// What the cache consulted for this request currently holds on
+    /// disk, in bytes, or `None` when no cache lookup happened.
+    ///
+    /// Kept in filesystem blocks for the reason given on
+    /// [`Request::cache_zone_max_size`], and converted here for the
+    /// same reason.
+    #[cfg(ngx_feature = "http_cache")]
+    pub fn cache_zone_used_size(&self) -> Option<u64> {
+        let file_cache = self.file_cache()?;
+        // SAFETY: an initialized file cache holds its shared state,
+        // which the cache manager keeps up to date.
+        unsafe {
+            let sh = (*file_cache).sh;
+            if sh.is_null() {
+                return None;
+            }
+            Some((*sh).size as u64 * (*file_cache).bsize as u64)
+        }
+    }
+
+    /// The filesystem block size the cache accounts in, or `None` when
+    /// no cache lookup happened.
+    #[cfg(ngx_feature = "http_cache")]
+    pub fn cache_zone_block_size(&self) -> Option<usize> {
+        let file_cache = self.file_cache()?;
+        // SAFETY: an initialized file cache holds the field.
+        Some(unsafe { (*file_cache).bsize })
+    }
+
+    /// The file cache behind this request, if it consulted one.
+    #[cfg(ngx_feature = "http_cache")]
+    fn file_cache(&self) -> Option<*mut crate::ffi::ngx_http_file_cache_t> {
+        if self.0.cache.is_null() {
+            return None;
+        }
+        // SAFETY: `cache` is non-null per the check above; the pointer
+        // it holds is populated by `ngx_http_file_cache_init` in the
+        // master before workers fork.
+        let file_cache = unsafe { (*self.0.cache).file_cache };
+        if file_cache.is_null() {
+            return None;
+        }
+        Some(file_cache)
+    }
+
     /// Pointer to a [`ngx_connection_t`] client connection object.
     ///
     /// [`ngx_connection_t`]: https://nginx.org/en/docs/dev/development_guide.html#connection
@@ -866,8 +930,8 @@ mod tests {
     mod cache {
         use super::*;
         use crate::ffi::{
-            NGX_HTTP_CACHE_HIT, NGX_HTTP_CACHE_MISS, ngx_http_cache_t, ngx_http_file_cache_t,
-            ngx_http_upstream_t, ngx_shm_zone_t, ngx_str_t,
+            NGX_HTTP_CACHE_HIT, NGX_HTTP_CACHE_MISS, ngx_http_cache_t, ngx_http_file_cache_sh_t,
+            ngx_http_file_cache_t, ngx_http_upstream_t, ngx_shm_zone_t, ngx_str_t,
         };
         use crate::http::CacheStatus;
 
@@ -929,6 +993,58 @@ mod tests {
             let mut r = zeroed_request();
             r.cache = &raw mut cache;
             assert!(request_from(&mut r).cache_zone_name().is_none());
+        }
+
+        #[test]
+        fn zone_sizes_none_when_no_cache_lookup() {
+            let mut r = zeroed_request();
+            let req = request_from(&mut r);
+            assert_eq!(req.cache_zone_max_size(), None);
+            assert_eq!(req.cache_zone_used_size(), None);
+            assert_eq!(req.cache_zone_block_size(), None);
+        }
+
+        #[test]
+        fn zone_sizes_come_back_in_bytes_not_blocks() {
+            // What nginx holds: max_size and sh->size counted in
+            // blocks of bsize, the division done once in
+            // ngx_http_file_cache_init.  Reading either field
+            // directly would answer 256 and 64 here.
+            let mut sh: ngx_http_file_cache_sh_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            sh.size = 64;
+
+            let mut file_cache: ngx_http_file_cache_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            file_cache.max_size = 256;
+            file_cache.bsize = 4096;
+            file_cache.sh = &raw mut sh;
+
+            let mut cache: ngx_http_cache_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            cache.file_cache = &raw mut file_cache;
+
+            let mut r = zeroed_request();
+            r.cache = &raw mut cache;
+            let req = request_from(&mut r);
+
+            assert_eq!(req.cache_zone_max_size(), Some(1024 * 1024));
+            assert_eq!(req.cache_zone_used_size(), Some(256 * 1024));
+            assert_eq!(req.cache_zone_block_size(), Some(4096));
+        }
+
+        #[test]
+        fn used_size_none_when_shared_state_null() {
+            // sh stays null after zero-init: a cache the manager has
+            // not brought up yet has no running total to report.
+            let mut file_cache: ngx_http_file_cache_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            file_cache.bsize = 4096;
+
+            let mut cache: ngx_http_cache_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            cache.file_cache = &raw mut file_cache;
+
+            let mut r = zeroed_request();
+            r.cache = &raw mut cache;
+            assert_eq!(request_from(&mut r).cache_zone_used_size(), None);
         }
 
         #[test]
