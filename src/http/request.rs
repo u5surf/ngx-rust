@@ -333,7 +333,9 @@ impl Request {
     ///
     /// For example, this flag is used by `HTTP HEAD` requests.
     pub fn header_only(&self) -> bool {
-        self.0.header_only() != 0
+        // SAFETY: self.0 is a valid request; the accessor is a C function that
+        // reads the bitfield with the layout the C compiler assigned it.
+        unsafe { nginx_sys::ngx_http_request_get_header_only(&raw const self.0) != 0 }
     }
 
     /// request method
@@ -435,7 +437,8 @@ impl Request {
         if sr.request_body.is_null() {
             return Status::NGX_ERROR;
         }
-        sr.set_header_only(1 as _);
+        // SAFETY: sr is the subrequest nginx just created for us.
+        unsafe { nginx_sys::ngx_http_request_set_header_only(sr, 1) };
         Status(r)
     }
 
